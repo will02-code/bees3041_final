@@ -1,0 +1,1084 @@
+---
+title: "Big Data- Predicting Leaf Area with AusTraits - Code"
+author: "Monique Lush, Will Wright, Peta Smit-Colbran, Lizzy Raphaels and Aya Miller"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Loading Packages and Libraries
+
+```{r}
+# Install packages required for the project. 
+#install.packages("tidyverse")
+#install.packages("austraits")
+#install.packages("plotly")
+#install.packages("ranger")
+
+# Load Libraries required for the project. 
+library(tidyverse)
+library(austraits)
+library(plotly)
+library(ranger)
+
+```
+
+# Accessing Data and Initial Manipulation
+
+```{r}
+#Load AusTraits into R. 
+austraits<- readRDS("austraits-0e1c08b0.rds")
+all_traits<-austraits$traits
+(austraits %>% join_taxonomy)$traits -> all_traits
+
+
+top_15_traits<-all_traits |> 
+  group_by(trait_name) |> 
+  summarise(n=n()) |> 
+  arrange(desc(n))|>
+  head(15)|>
+  pull(trait_name)
+# Add leaf shape
+top_15_traits<-top_15_traits |>
+  append("leaf_shape")|>
+  append("leaf_area")
+
+# Extract only the datapoints with the top 15. This reduces the size significantly
+top_15_dataset <- all_traits |>
+  filter(trait_name %in% top_15_traits| trait_name == "leaf_area")
+
+# Seperate out categorical and non_categorical variables, as they need to be 
+# treated differently
+top_15_dataset |> filter(!str_detect(value, "\\d")) -> top_15_dataset_cat
+top_15_dataset |> filter(str_detect(value, "\\d")) -> top_15_dataset_num
+
+# If using the imported dataset (later than 4.1.0), this needs to be run to fix 
+# leaf shape issues.
+
+leaf_shape<-top_15_dataset_cat %>%
+  filter(trait_name=="leaf_shape")%>%
+  mutate(value=str_split(value, " "))|>
+  unnest(value)
+top_15_dataset_cat <- top_15_dataset_cat |> 
+  filter(trait_name!="leaf_shape")
+top_15_dataset_cat<-rbind(top_15_dataset_cat, leaf_shape)
+
+# This part formats the the categorical data. The end result of this code 
+# block is a dataset that has the top categorical variable for each trait in each
+# species if applicable. This is important as some species have multiple values for
+# each trait. The resulting dataset is much similified, and has only three cols:
+# "taxon_name", "trait_name", and "value"
+
+top_15_dataset_cat_final<-top_15_dataset_cat |>
+  group_by(taxon_name, trait_name, value)|> #These 3 lines get a count of each 
+  # value for each trait in every species
+  summarise(
+    n_value = n()
+  )|>
+  ungroup()|>
+  group_by(taxon_name, trait_name)|> # groups by traits within taxons
+  arrange(desc(n_value), .by_group = TRUE )|> #sort by the n value. 
+  summarise(
+    value = first(value) # Take the top n value. This is either the majority, or
+    # a 50/50 random value
+  )|>
+  ungroup()
+
+
+# This section does a similar cleaning, but for the numeric data. 
+
+# convert value to numeric. 
+top_15_dataset_num$value = as.numeric(top_15_dataset_num$value)
+
+# take averages of common columns (i.e. where a species has two measurements of 
+# a trait, it is averaged for that species)
+top_15_dataset_num_final<-top_15_dataset_num |>
+  group_by(taxon_name, trait_name) |> 
+  summarise(value = mean(value)) |> 
+  ungroup()
+  #mutate(value = as.character(value))#need to change back to character for pivot
+
+# Combine categorical and numerical data
+top_15_dataset_long<-rbind(top_15_dataset_num_final, top_15_dataset_cat_final)
+
+
+#pivot around so that combo is on top. still maintains values
+
+top_15_dataset_wide <- top_15_dataset_long |>
+  pivot_wider(names_from = trait_name, values_from = value)
+
+# change the relevant columns to numeric, and create a LxW column. Create log 
+# columns for leaf length, width, area, and LXW
+top_15_dataset_wide$leaf_length = as.numeric(top_15_dataset_wide$leaf_length)
+top_15_dataset_wide$leaf_width = as.numeric(top_15_dataset_wide$leaf_width)
+top_15_dataset_wide$leaf_area = as.numeric(top_15_dataset_wide$leaf_area)
+
+top_15_dataset_wide$plant_height = as.numeric(top_15_dataset_wide$plant_height)
+top_15_dataset_wide$seed_dry_mass = as.numeric(top_15_dataset_wide$seed_dry_mass)
+
+top_15_dataset_wide$lxw = top_15_dataset_wide$leaf_length*top_15_dataset_wide$leaf_width
+top_15_dataset_wide$log_length = log(top_15_dataset_wide$leaf_length)
+top_15_dataset_wide$log_width = log(top_15_dataset_wide$leaf_width)
+top_15_dataset_wide$log_lxw = log(top_15_dataset_wide$lxw)
+top_15_dataset_wide$log_area = log(top_15_dataset_wide$leaf_area)
+
+# add families to the wide dataframe
+species_list <- unique(top_15_dataset_wide$taxon_name)
+families <- all_traits |> 
+  filter(taxon_name %in% species_list)|>
+  select(c("taxon_name", "family"))|>
+  unique()
+top_15_dataset_wide<-left_join(top_15_dataset_wide, families)
+
+
+```
+
+# Identifying General Data Trends
+
+```{r}
+#examining leaf width and leaf lengths predictive capacity of leaf area in Austraits 
+
+#taking trait data 
+data <- austraits$traits
+
+#creating the dataframe to plot
+#numerical trait dataframe taking the average trait value per species
+LWAH <- data %>%
+   select(taxon_name, trait_name, value) %>%
+   filter(trait_name %in% c('leaf_area', 'leaf_length', 'leaf_width', 'plant_height')) %>% 
+   mutate(value = as.numeric(value))%>%
+   group_by(taxon_name, trait_name) %>% 
+   summarise(avg_value = mean(value)) %>%
+   pivot_wider(names_from = trait_name, values_from = avg_value)%>%
+   na.omit()
+
+#Function to extract the most frequently recorded observation per species for categorical trait variables.
+most_frequent_character<-function(column_data) {
+  if (!is.vector(column_data) || !all(is.character(column_data))){
+    stop('input must be a vector of characters.')
+  }
+  char_counts <- table(column_data)
+  max_counts <- max(char_counts)
+  most_frequent_char <- names(char_counts[char_counts==max_counts])
+  return(most_frequent_char[1])  #first value 
+}
+
+#dataframe with categorical variables of interest
+high_coverage_cat <- data %>%
+  select(taxon_name, trait_name, value)%>% 
+  filter(trait_name %in% c('plant_growth_form', 'woodiness_detailed','life_history','leaf_shape'))%>%
+  group_by(taxon_name, trait_name)%>%
+  summarise(value=most_frequent_character(value))%>%
+  pivot_wider(names_from = trait_name, values_from = value)
+
+#joining the two datasets together 
+lwa_subset <- left_join(LWAH, high_coverage_cat, by="taxon_name")%>% 
+  distinct(taxon_name, .keep_all = TRUE)
+
+#adding in family data
+#family data from AusTraits
+family_data <- austraits$taxa %>% select(taxon_name, family)
+
+#joing family data to lwa_subset, removing NAs, and adding a column multiplying LxW to estimate leaf area
+lwa_subset <- left_join(lwa_subset, family_data, by="taxon_name")%>% 
+  distinct(taxon_name, .keep_all = TRUE)%>% 
+  rename('fam'='family')%>%
+  mutate(LxW = leaf_length*leaf_width)%>%
+  na.omit
+
+#Plotting leaf area ~ LxW on a log scale and adding a Linear Model and line representing a perfect 1:1 relationship
+ggplot(lwa_subset, aes(LxW, leaf_area)) + geom_point()+ 
+  geom_smooth(method='lm', col='blue')+ #adds abline from the linear model 
+  annotate('text', x=1, y=1e5, label='R2=0.76525')+ 
+  annotate('text', x=1, y=17500, label='p<2.2e6')+ 
+  ggtitle("Relationship between Leaf Area and Leaf Length and Width")+
+  scale_x_log10()+ 
+  scale_y_log10()+ 
+  xlab('log of leaf length x leaf width') + 
+  ylab('log of leaf area')+ 
+  geom_abline(intercept=0, slope=1, col='red')+
+  theme_classic()
+
+
+ggplot(data = top_15_dataset_wide, aes(x=leaf_area, y=lxw))+
+  geom_point()+
+  geom_abline(slope=1, intercept=0, col="red")+
+
+  xlab("Length x Width")+
+  ylab("Leaf Area")
+#Removed outliers
+top_15_dataset_wide |>
+  filter(lxw<250000)|>
+  ggplot(aes(x=leaf_area, y=lxw))+
+  geom_point()+
+  geom_abline(slope=1, intercept=0, col="red")+
+  xlab("Length x Width")+
+  ylab("Leaf Area")
+#logged axis
+top_15_dataset_wide |>
+  ggplot(aes(x=leaf_area, y=lxw))+
+  geom_point()+
+  geom_abline(slope=1, intercept=0, col="red")+
+  xlab("Length x Width")+
+  ylab("Leaf Area")+
+  scale_x_log10()+
+  scale_y_log10()
+
+#Basic lm
+first_model<-lm(log_area~log_lxw, data = top_15_dataset_wide)
+summary(first_model)
+#Plot residuals
+ggplot(mapping=aes(x=first_model$residuals))+
+  geom_histogram()
+ggplot(mapping=aes(y=first_model$residuals, x=seq(first_model$residuals)))+
+  geom_point()
+
+```
+
+# Outlier Identification
+
+## Dataframe Creation
+
+```{r}
+#trait data from AusTraits
+data<- austraits$traits
+
+#numerical trait dataframe taking the average trait value per species
+LWAH <- data %>%
+   select(taxon_name, trait_name, value) %>%
+   filter(trait_name %in% c('leaf_area', 'leaf_length', 'leaf_width', 'plant_height')) %>% 
+   mutate(value = as.numeric(value))%>%
+   group_by(taxon_name, trait_name) %>% 
+   summarise(avg_value = mean(value)) %>%
+   pivot_wider(names_from = trait_name, values_from = avg_value)%>%
+   na.omit()
+
+#Function to extract the most frequently recorded observation per species for categorical trait variables.
+most_frequent_character<-function(column_data) {
+  if (!is.vector(column_data) || !all(is.character(column_data))){
+    stop('input must be a vector of characters.')
+  }
+  char_counts <- table(column_data)
+  max_counts <- max(char_counts)
+  most_frequent_char <- names(char_counts[char_counts==max_counts])
+  return(most_frequent_char[1])  #first value 
+}
+
+#dataframe with categorical variables of interest
+high_coverage_cat <- data %>%
+  select(taxon_name, trait_name, value)%>% 
+  filter(trait_name %in% c('plant_growth_form', 'woodiness_detailed','life_history','leaf_shape'))%>%
+  group_by(taxon_name, trait_name)%>%
+  summarise(value=most_frequent_character(value))%>%
+  pivot_wider(names_from = trait_name, values_from = value)
+
+#joining the two datasets together 
+lwa_subset <- left_join(LWAH, high_coverage_cat, by="taxon_name")%>% 
+  distinct(taxon_name, .keep_all = TRUE)
+
+#adding in family data
+
+#family data from AusTraits
+family_data <- austraits$taxa %>% select(taxon_name, family)
+
+#joing family data to lwa_subset, removing NAs, and adding a column multiplying LxW to estimate leaf area
+lwa_subset <- left_join(lwa_subset, family_data, by="taxon_name")%>% 
+  distinct(taxon_name, .keep_all = TRUE)%>% 
+  rename('fam'='family')%>%
+  mutate(LxW = leaf_length*leaf_width)%>%
+  na.omit
+```
+
+## Species Outliers Classified by Residuals
+
+```{r}
+#Classifying Species Outliers by having residuals >2 or <2 residuals away from a standardized mean 
+
+#linear model with log transformed leaf area ~ log transformed length*width 
+lwa_model <- lm(log(leaf_area) ~ log(LxW), lwa_subset) 
+
+#normalizing the mean and residuals 
+std.resid <- (lwa_model$residuals - mean(lwa_model$residuals))/sd(lwa_model$residuals)
+
+#plotting the standardized residuals 
+plot(std.resid) 
+hist(std.resid)
+
+#put residuals into the dataset 
+lwa_subset$residuals <- std.resid
+
+#outlier species with residuals 2 standard deviations away from the mean
+outliers <- lwa_subset %>% filter (residuals > 2| residuals < -2)
+
+#interactive plot to look at outlier species
+p <- ggplot(lwa_subset, aes(LxW, leaf_area, label=taxon_name)) + 
+  geom_point()+ 
+  ggtitle("Species Residuals >2 or <-2")+ 
+  scale_x_log10()+ scale_y_log10()+ 
+  xlab('log of leaf length x leaf width') + ylab('log of leaf area')+ geom_abline(intercept=0, slope=1, col='red')+ 
+  geom_point(data=lwa_subset 
+             %>% filter(taxon_name %in% outliers$taxon_name), col='orange')+ 
+  theme_classic() 
+ggplotly()
+```
+
+## Family Plots for Investigation
+
+```{r}
+#list of unqiue family names
+distinct_families <- unique(lwa_subset$fam)
+
+#creating a loop that makes one Area vs LxW plot for family highlighting the species in that family
+for(family in distinct_families){ 
+  p<-ggplot(lwa_subset, aes(LxW, leaf_area))+ 
+    geom_point()+ 
+    ggtitle(paste('Area vs. LxW +',family))+ 
+    scale_x_log10()+ 
+    scale_y_log10()+
+    xlab('log of leaf length x leaf width') + 
+    ylab('log of leaf area')+
+    theme_classic()+ 
+    geom_abline(intercept=0, slope=1, col='red')+
+    geom_point(data=lwa_subset %>% filter(fam==family), col='orange')
+}
+
+#interactive family plot
+p <- ggplot(lwa_subset, aes(LxW, leaf_area, label=fam)) + 
+  geom_point()+ 
+  ggtitle("Leaf Area vs LxW + Compound")+ 
+  scale_x_log10()+ 
+  scale_y_log10()+
+  xlab('log of leaf length x leaf width') + ylab('log of leaf area')+
+  geom_abline(intercept=0, slope=1, col='red')+ 
+  theme_classic()
+ggplotly(p)
+```
+
+## Leaf Shape Plots for Investigation 
+
+```{r}
+#list of unique shape names
+distinct_shape <- unique(lwa_subset$leaf_shape)
+
+#loop  that makes one Area vs LxW plot for each leaf shape highlighing species with that specific leaf shape
+for(family in distinct_families){ 
+  p<-ggplot(lwa_subset, aes(LxW, leaf_area))+ 
+    geom_point()+ 
+    ggtitle(paste('Area vs. LxW +',family))+ 
+    scale_x_log10()+ 
+    scale_y_log10()+
+    xlab('log of leaf length x leaf width') + 
+    ylab('log of leaf area')+
+    theme_classic()+ 
+    geom_abline(intercept=0, slope=1, col='red')+
+    geom_point(data=lwa_subset %>% filter(fam==family), col='orange') }
+```
+
+## Leaf Compoundness Plots for Investigation
+
+```{r}
+#a dataframe with taxon name and leaf compoundness value per species
+compound_avg <- data %>% 
+  select(taxon_name, trait_name, value) %>% 
+  filter(trait_name == 'leaf_compoundness') %>% 
+  select(taxon_name, value ) 
+colnames(compound_avg) <-c('taxon_name', 'leaf_compoundness')
+
+#joining the leaf compoundness values to the lwa subset dataframe 
+lwa_subset <- left_join(lwa_subset, compound_avg, by = "taxon_name") %>% distinct(taxon_name, .keep_all = TRUE)
+
+#Plotting Area vs LW highlighting compound leaves 
+ggplot(lwa_subset, aes(LxW, leaf_area)) + geom_point()+
+  ggtitle("Leaf Area vs LxW + Compound")+ 
+  scale_x_log10()+ 
+  scale_y_log10()+ 
+  xlab('log of leaf length x leaf width') + 
+  ylab('log of leaf area')+ 
+  geom_abline(intercept=0, slope=1, col='red')+ 
+  geom_point(data=lwa_subset %>% filter(leaf_compoundness=='compound'), col='orange')+ theme_classic()
+
+#Plotting Area vs. LW highlighting simple leaves 
+ggplot(lwa_subset, aes(LxW, leaf_area)) + 
+  geom_point()+ 
+  ggtitle("Leaf Area vs LxW + Simple")+
+  scale_x_log10()+ 
+  scale_y_log10()+ 
+  xlab('log of leaf length x leaf width') + 
+  ylab('log of leaf area')+ 
+  geom_abline(intercept=0, slope=1, col='red')+
+  geom_point(data=lwa_subset %>% filter(leaf_compoundness=='simple'), col='orange')+ 
+  theme_classic()
+```
+
+
+# Dataset ID data cleaning
+
+```{r}
+
+
+#split data
+all_traits<-austraits$traits
+#combine taxonomy
+(austraits %>% join_taxonomy)$traits -> all_traits
+#filter for leaf area
+all_traits |> filter(trait_name=="leaf_area") ->leaf_area_species
+#get species that have data about leaf area
+leaf_area_species <- unique(leaf_area_species$taxon_name)
+#filter overall data so that it is only species with leaf area
+all_traits[all_traits$taxon_name %in% leaf_area_species,]->only_leaf_area
+#get rid of categorical data
+only_leaf_area |> filter(trait_name%in%c("leaf_area", "leaf_width", "leaf_length")) -> only_leaf_area
+#select relevant columns
+select(only_leaf_area, c("taxon_name", "trait_name", "value", "dataset_id"))->only_leaf_area
+#convert to numeric
+only_leaf_area$value = as.numeric(only_leaf_area$value)
+#take averages of common columns (i.e. where a species has two measurements of 
+# a trait, it is averaged for that species)
+only_leaf_area %>% 
+  group_by(taxon_name, trait_name, dataset_id) %>%
+  summarise(average = mean(value)) %>%
+  ungroup()-> output
+#pivot around so that combo is on top. still maintains values 
+output |>
+  pivot_wider(names_from = trait_name, values_from = c(average)) ->output_wide
+#get LxW
+output_wide$LxW = output_wide$leaf_width*output_wide$leaf_length
+
+#This is exclusive to the data with the dataset ID. Note that this is not 
+#taking into account any categorical variables
+
+
+#removing rows that have an NA in all three columns
+output_wide |> 
+  filter(!is.na(leaf_area)|!is.na(leaf_width)|!is.na(leaf_length)) -> output_wide_no_nas
+
+#bit of a hodge podge. have relied on previous summarise, but also
+#this link https://stackoverflow.com/questions/25759891/dplyr-summarise-each-with-na-rm and 
+# this link https://stackoverflow.com/questions/44803575/how-can-i-summarise-a-factor-or-character-variable 
+
+# I think there are better ways to do this (namely, this is a string, and not a 
+#list), which has implications according to stack overflow (apparently. see 
+#second link)
+dataset_id_wide<-output_wide_no_nas |>
+  group_by(taxon_name)|>
+  summarise(length = mean(leaf_length, na.rm = TRUE), width = mean(leaf_width, na.rm = TRUE), area = mean(leaf_area, na.rm = TRUE), datasets = paste(unique(dataset_id), collapse = ","))
+
+dataset_id_wide |>
+  filter(!is.nan(area)&!is.nan(length)&!is.nan(width)) -> dataset_id_wide
+
+dataset_id_wide$lxw = dataset_id_wide$length*dataset_id_wide$width
+
+
+```
+
+# Dataset ID plotting
+```{r}
+
+dataset_list<-unique(output_wide_no_nas$dataset_id)
+
+
+p<-ggplot(data = dataset_id_wide, aes(y=log(area), x = log(lxw), label=datasets))+
+    geom_point()+
+    geom_abline(intercept = 0, slope = 1, col="red")+
+    xlab("Leaf Length x Leaf Width")+
+    ylab("Leaf Area")
+ggplotly(p)    
+
+
+for (i in 1:length(dataset_list)) {
+  ggplot(data = dataset_id_wide, aes(y=log(area), x = log(lxw)))+
+    geom_point()+
+    geom_abline(intercept = 0, slope = 1, col="red")+
+    xlab("Leaf Length x Leaf Width")+
+    ylab("Leaf Area")+
+    geom_point(data=dataset_id_wide %>%
+               filter(grepl(dataset_list[[i]], datasets)), col='orange')  
+#CHANGE PATH TO TARGET DIRECTORY
+ggsave(filename = paste0(dataset_list[[i]],".png"), device = png, path = paste0(getwd()))
+print(paste0(i, "/", length(dataset_list))
+}
+
+```
+
+
+## Calculating and Plotting Importance
+
+```{r}
+#Create data frame with AusTraits
+trait_data <- austraits$traits%>%
+  filter(is.na(life_stage) | !(life_stage %in% c("seedling", "sapling")))%>%
+  filter(is.na(replicates) | !(replicates %in% "leaflets"))
+
+#Create character values that contain all taxa that have leaf area values.
+species_list <- trait_data %>%
+  filter(trait_name == "leaf_area") %>%
+  pull(taxon_name)%>%
+  unique()
+
+#Create a data frame that calculates the number of species that have a value for each trait- as a measurement of trait coverage. Then select the top 15 highest coverage traits. 
+top_traits <- trait_data %>% 
+  count(taxon_name, trait_name) %>% 
+  count(trait_name) %>%
+  top_n(15, n)
+
+##Leaf Shape and Family Data have different formats. The dataframes need to be created seperately. 
+
+#Creating Family data frame. 
+taxa <- austraits$taxa
+taxa <- taxa %>% select(taxon_name, family)
+
+#Creating Leaf Shape data frame. Making leaf_shape values classed as a character so that spaces between leaf shape types could be substituted for an underscore. This was needed so it would run in ranger. 
+leaf_shape_data <- trait_data %>%
+  filter(trait_name == "leaf_shape") %>%
+  select(taxon_name, trait_name, value) %>%
+  mutate(value = as.character(value))%>%
+  mutate(value = gsub("-", "_", value))
+leaf_shape_data <- separate_rows(leaf_shape_data, value, sep = " ")
+
+
+#Create a dataset with categorical variables as factors so that they can be run through ranger.
+factor_model_dataset <- trait_data %>% 
+  filter(taxon_name %in% species_list)%>%
+  filter(is.na(life_stage) | !(life_stage %in% c("seedling", "sapling")))%>%
+  filter(is.na(replicates) | !(replicates %in% "leaflets")) %>%
+  filter(trait_name %in% top_traits$trait_name | trait_name == "leaf_area")%>%
+  select(trait_name, taxon_name, value) %>%
+  mutate(value_type = ifelse(grepl("\\d", value), "numeric", "character")) %>%
+  filter(!(trait_name %in% c("flowering_time", "leaf_shape")))
+
+#Join Leaf Shape onto this data set. 
+leaf_shape_data <- leaf_shape_data %>% mutate(value_type = "character")
+#Bind the Leaf shape dataset and categorical factor dataset together. 
+factor_model_dataset <- rbind(factor_model_dataset, leaf_shape_data)
+
+#Create a data frame with key numeric traits, making sure values are registered as numeric and then pivoting the data frame wider. This creates a data frame with individuals traits as columns. 
+num_traits <- factor_model_dataset %>% 
+  filter(value_type == "numeric")%>%
+  group_by(taxon_name, trait_name) %>%
+  summarise(compiled_value = mean(as.numeric(value))) %>%
+  select(taxon_name, trait_name, compiled_value) 
+#Creates a model with length times width for ranger
+lw_factor_model_dataset <- num_traits %>%
+  pivot_wider(names_from = trait_name, values_from = compiled_value)%>%
+  mutate(length_by_width = leaf_length*leaf_width)%>%
+  mutate(across(where(is.numeric), log))%>%
+  select(leaf_area, length_by_width, taxon_name)%>%
+  na.omit()
+#Finishes the numeric traits database
+num_traits <- num_traits%>%  mutate(compiled_value = log(compiled_value)) %>%
+  pivot_wider(names_from = trait_name, values_from = compiled_value)
+
+#Creates a wide data frame of the top 15 traits. 
+factor_model_dataset <- factor_model_dataset %>%
+  filter(value_type == "character") %>%
+  group_by(taxon_name, trait_name, value) %>%
+  mutate(compiled_value = n()) %>%
+  ungroup()%>%
+  distinct() %>%
+  group_by(taxon_name, trait_name)%>%
+  mutate(max_compiled_value = sum(compiled_value == max(compiled_value)))%>%
+  slice(which.max(compiled_value))%>%
+  mutate(compiled_value = value) %>%
+  ungroup()%>%
+  select(taxon_name, trait_name, compiled_value) %>%
+  pivot_wider(names_from = trait_name, values_from = compiled_value)%>%
+  left_join(num_traits, by = "taxon_name")%>% 
+  left_join(taxa, by = "taxon_name")
+
+#We wanted to test how the R2 and RMSE would be affected if we used the same taxa for model comparison
+factor_model_dataset <- factor_model_dataset %>%
+  filter(!(is.na(leaf_length))
+         &!(is.na(leaf_width)) 
+         &!(is.na(plant_height))
+         &!(is.na(plant_growth_form))
+         &!(is.na(family))
+         &!(is.na(leaf_shape))
+         &!(is.na(woodiness_detailed))
+         &!(is.na(life_history)))
+
+factor_model_taxon_list <- factor_model_dataset %>% pull(taxon_name)%>% unique()
+lw_factor_model_dataset <- lw_factor_model_dataset %>% 
+  filter(taxon_name %in% factor_model_taxon_list)%>%
+  ungroup()%>%
+  select(-taxon_name)
+factor_model_dataset <- factor_model_dataset %>%
+  select(-taxon_name)
+
+#Takes the traits data frame and removes all N/A values the only species included are those that hold values for each of the top 15 traits. 
+factor_model_dataset_nona <- factor_model_dataset %>% na.omit()
+
+##Functions to create dataframes for models that include combinations of the most important traits and leaf area.
+
+#Create a function to calculate the feature importance of a random forest model. 
+test_importance <- function(model_data){
+  ranger_model <- ranger(data = model_data , formula = leaf_area~., importance = 'impurity')
+  importance <- importance(ranger_model)
+  importance <- importance %>% as.data.frame()
+  importance_table <- data.frame(
+    feature_importance = importance$.,
+    variables = rownames(importance)) 
+  return(importance_table)}
+
+#Create a function to graph importance.  
+graph_importance <- function(importance_table, top_include){
+  importance_graph <- importance_table %>%
+    top_n(top_include, feature_importance) %>%
+    mutate(variables = gsub("_", " ", variables))
+  feature_importance_plot <- 
+    ggplot(data = importance_graph, 
+           aes(x = reorder(variables, feature_importance),
+               y = feature_importance))+
+    geom_bar(stat = 'identity')+
+    coord_flip()+
+    xlab("Predictor Variables")+
+    ylab("Feature Importance")+
+    theme_classic()
+  return(feature_importance_plot)}
+
+#Create a function to create dataframes which include the n most important variables
+create_important_model_dataframes <- function(importance_table, importance_limit, full_dataset){
+  important_traits <- importance_table %>%
+    top_n(importance_limit, feature_importance)
+  top_colnames <- unique(important_traits$variables)
+  new_dataframe <- full_dataset %>% 
+    select(leaf_area, all_of(top_colnames))%>%
+    na.omit()
+  return(new_dataframe)}
+
+#Create a function to create dataframes for each variable in the importance table and leaf area. 
+create_single_variable_model_dataframes <- function(importance_table, row_selection, full_dataset){
+  selected_trait <- importance_table %>% arrange(desc(feature_importance))
+  selected_trait <- importance_table[row_selection, ]
+  selected_trait <- selected_trait$variable
+  new_dataframe <- full_dataset %>% 
+    select(leaf_area, all_of(selected_trait))%>%
+    na.omit()}
+
+#Create a function to create dataframes for each variable in the importance table, leaf length, leaf width and leaf area. 
+create_single_variable_plus_dimensions_model_dataframes <- function(importance_table, row_selection, full_dataset){
+    selected_trait <- importance_table %>% arrange(desc(feature_importance))
+  selected_trait <- importance_table[row_selection, ]
+  selected_trait <- selected_trait$variable
+  new_dataframe <- full_dataset %>% 
+    select(leaf_area, leaf_length, leaf_width, all_of(selected_trait))%>%
+    na.omit()}
+
+## Now that we have all the functions ready, we can use these to test feature importance. 
+
+#Running a function to calculate the importance of the top 15 variables. 
+set.seed(234)
+importance <- test_importance(factor_model_dataset_nona)
+#Graphing the importance. 
+importance_plot <- graph_importance(importance, 15)
+importance_plot <- importance_plot+
+  theme(text = element_text(size = 30))
+#importance_plot #plot importance in r studio
+#ggsave(file.path("path", "importance.png"), importance_plot, height = 10, width = 10) #save importance to folder called "plots" 
+
+#Plotting importance with species coverage 
+
+#Create a data frame including taxon name, trait and family. 
+taxa_coverage <- austraits$taxa %>%
+  mutate(trait_name = "family") %>%
+  select(taxon_name, trait_name)
+
+#Creates a data frame with trait coverage and then categorise coverage into different groups- which is used to colour coordinate in the following importance plot. 
+trait_coverage <- austraits$traits %>%
+  select(taxon_name, trait_name) %>%
+  filter(trait_name %in% top_traits$trait_name)%>%
+  rbind(taxa_coverage)%>%
+  distinct()%>%
+  filter(!(taxon_name %in% species_list))%>%
+  count(trait_name)%>%
+  mutate(percent_current_Austraits_species = n/34060)%>%
+  rename(variables = trait_name) %>%
+  left_join(importance, by = "variables")%>%
+  mutate(variables = gsub("_", " ", variables))%>%
+  mutate(coverage = case_when(
+    percent_current_Austraits_species < 0.50 ~ ">35%",
+    percent_current_Austraits_species >= 0.50 & percent_current_Austraits_species < 0.65 ~ ">50%",
+    percent_current_Austraits_species >= 0.65 & percent_current_Austraits_species < 0.80 ~ ">65%",
+    percent_current_Austraits_species >= 0.80 ~ ">80%")) %>%
+  na.omit()
+
+#Added breaks into the coverage to ensure the defined thresholds plot in the graph. 
+breaks <- seq(35, 85, by = 15)
+
+#Creates an importance plot that captures coverage with a colour scale.
+plot_important_traits <- 
+  ggplot(trait_coverage, 
+         aes(x = reorder(variables, feature_importance), 
+             y = feature_importance,
+             fill = coverage))+
+  geom_bar(stat = 'identity')+
+  coord_flip()+
+  xlab("Predictor Variables")+
+  ylab("Feature Importance")+
+  theme_classic()+
+  theme(text = element_text(size = 13))+
+  scale_fill_manual(values = c(">35%" = "#A1D99B", 
+                               ">50%" = "#74C476",
+                               ">65%" = "#238B45",
+                               ">80%" = "#005A32"))+
+  labs(fill = "Coverage")
+
+#plots important traits in r studio
+plot_important_traits 
+#ggsave(file.path("plots", "importance_coloured_by_coverage.png"), plot_important_traits, height = 8, width = 12)
+
+```
+
+# Predictive Model Creation
+
+## Model Creation using varying combinations of top 15 importance traits.
+
+```{r}
+#Run a loop to create a list containing dataframes where variables are added in order of importance. 
+important_factor_models <- list()
+for (i in 1:15) {
+  result <- create_important_model_dataframes(importance, i, factor_model_dataset)
+  name <- paste0("important_traits_", i)
+  important_factor_models[[name]] <- result}
+
+importance <- importance %>% arrange(desc(feature_importance))
+#Run a loop to create a list containing dataframes with each important variable and leaf area 
+single_variable_models <- list()
+for(i in 1:6) {
+  result <- create_single_variable_model_dataframes(importance, i, factor_model_dataset)
+  name <- paste0("single_traits_", i)
+  single_variable_models[[name]] <- result}
+
+#Other Combinations of Variables to test
+combinations_list <- list(leaf_dimensions_height_growth_family_shape =
+                            c("leaf_length", 
+                           "leaf_width", 
+                           "plant_height", 
+                           "plant_growth_form",
+                           "family",
+                           "leaf_shape"),
+                          leaf_dimensions_height_growth_family_shape_woodiness =
+                            c("leaf_length", 
+                           "leaf_width", 
+                           "plant_height", 
+                           "plant_growth_form",
+                           "family",
+                           "leaf_shape",
+                           "woodiness_detailed"),
+                          leaf_dimensions_height_growth_family_shape_woodiness_life =
+                            c("leaf_length", 
+                           "leaf_width", 
+                           "plant_height", 
+                           "plant_growth_form",
+                           "family",
+                           "leaf_shape",
+                           "woodiness_detailed",
+                           "life_history"),
+                          growth_woodiness_life =
+                            c("plant_growth_form",
+                              "woodiness_detailed",
+                              "life_history"),
+                          growth_woodiness_life_family_shape =
+                            c("plant_growth_form",
+                              "woodiness_detailed",
+                              "life_history",
+                              "family",
+                              "leaf_shape"),
+                          leaf_dimensions_height_family =
+                            c("leaf_width",
+                              "leaf_length",
+                              "plant_height",
+                              "family"),
+                          leaf_dimensions_height_leaf_shape =
+                            c("leaf_length",
+                              "leaf_width",
+                              "plant_height",
+                              "leaf_shape"))
+
+other_models <- list()
+for (i in seq_along(combinations_list)){
+selected_trait <- combinations_list[[i]]
+new_data <- factor_model_dataset %>% 
+  select(leaf_area, all_of(selected_trait))%>% 
+  na.omit()
+other_models[[i]]<- new_data}
+
+#Join the model lists together.
+my_model_data <- c(important_factor_models, single_variable_models, other_models)
+my_model_data[["leaf_length_by_leaf_width"]] <- lw_factor_model_dataset
+
+#Create a function that renames the columns and trait values into a format that is readable for the ranger function (getting rid of spaces between words). 
+rename_dataframes <- function(data_list) {
+  for (i in seq_along(data_list)) {
+    col_names <- colnames(data_list[[i]])
+    old_name <- names(data_list)[i]
+    new_name <- paste(col_names, collapse = "_")
+    new_name <- paste(old_name, new_name)
+    new_name <- gsub(" ", "_", new_name)
+    names(data_list)[i] <- new_name}
+  return(data_list)}
+my_model_data <- rename_dataframes(my_model_data)
+
+
+```
+#Checking Model Coverage
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+
+known_area <- austraits$traits %>%
+  filter(is.na(life_stage) | !(life_stage %in% c("seedling", "sapling")))%>%
+  filter(is.na(replicates) | !(replicates %in% "leaflets")) %>%
+  filter(trait_name == "leaf_area")%>%
+  pull(taxon_name)%>%
+  unique()
+
+unknown_area <- austraits$traits %>%
+  filter(is.na(life_stage) | !(life_stage %in% c("seedling", "sapling")))%>%
+  filter(is.na(replicates) | !(replicates %in% "leaflets")) %>%
+  filter(!(taxon_name %in% known_area))
+
+check_length <- function(character_string){
+  unknown_area %>%
+    filter(trait_name == character_string) %>%
+    pull(taxon_name)%>%
+    unique()%>%
+    length()}
+check_length("leaf_width")
+check_length("leaf_length")
+check_length("plant_height")
+check_length("plant_growth_form")
+check_length("leaf_shape")
+
+taxa_to_bind <- taxa %>% 
+  mutate(trait_name = "family")%>%
+  select(taxon_name, trait_name)
+
+check_length <- function(character_values){
+  unknown_area %>%
+    select(trait_name, taxon_name)%>%
+    rbind(taxa_to_bind)%>%
+    filter(trait_name %in% character_values)%>%
+    mutate(value = 1)%>%
+    distinct()%>%
+    pivot_wider(values_from = value, names_from = trait_name)%>%
+    na.omit()%>%
+    pull(taxon_name)%>%
+    unique()%>%
+    length()}
+
+model_7_8 <- c("leaf_length", "leaf_width")
+check_length(model_7_8)
+model_9 <- c("leaf_length", "leaf_width", "plant_height")
+check_length(model_9)
+model_10 <- c("leaf_length", "leaf_width", "plant_height", "plant_growth_form")
+check_length(model_10)
+model_11 <- c("leaf_length", "leaf_width", "plant_height", "plant_growth_form", "family")
+check_length(model_11)
+model_12 <- c("leaf_length", "leaf_width", "plant_height", "plant_growth_form", "family", "leaf_shape")
+check_length(model_12)
+model_13 <- c("leaf_length", "leaf_width", "plant_height", "plant_growth_form", "family", "leaf_shape", "woodiness_detailed", "life_history")
+check_length(model_13)
+model_14 <- c("plant_growth_form", "woodiness_detailed", "life_history")
+check_length(model_14)
+model_15 <- c("plant_growth_form", "woodiness_detailed", "life_history", "family", "leaf_shape")
+check_length(model_15)
+
+```
+
+
+# Running Predictive Models
+
+```{r}
+##Models In Ranger
+#Create a function to run a random forest model with ranger. Splitting data into 75% training and 25% testing. 
+#Intended to run in a loop that will produce model statistics for all datasets.
+#Will return plots of predicted versus observed leaf area.
+run_ranger_model <- function(data, data_name, formula_string, seed_num, text_position, model_stats_data, ...){
+  npoints <- nrow(data)
+  set.seed(seed_num)
+  train_ids <- sample(npoints, 3/4*npoints) #randomly sample 3/4 of the points 
+  train <- data %>% slice(train_ids)
+  test <- data %>% slice(-train_ids)
+  relationship <- as.formula(formula_string)
+  set.seed(seed_num)
+  ranger_model <- ranger(relationship, 
+                  data = train)
+
+  #Create a function that returns the predicted values obtained from the model. 
+  pred <- function(fit, data) predict(fit, data = data)$prediction
+  data_pred <- test %>% 
+    mutate(predicted = pred(ranger_model, test))
+  model_stats <- data_pred %>%
+    summarise(r2 = cor(leaf_area, predicted)^2,
+            RMSE = sqrt(sum((leaf_area - predicted)^2)/n()))%>%
+    ungroup()%>%
+    mutate(
+      stats_text = paste0("RMSE = ", format(RMSE, digits=2), ", R2 =", format(r2, digits=2)),
+      model_name = data_name)
+  model_statistics <- rbind(model_stats_data, model_stats)
+  assign("model_statistics", model_statistics, envir = .GlobalEnv)
+  
+  
+  #This plots the observed vs predicted leaf area on a plot. 
+  model_plot <- data_pred %>%
+    ggplot(aes(leaf_area, predicted)) +
+    geom_point(col="darkgrey") +
+    geom_abline(intercept = 0, slope=1, linetype="dashed") +
+    geom_text(data = model_stats, aes(0, text_position, label = stats_text), hjust=0, col="red") +
+    labs(x="Observed Leaf Area", y="Predicted Leaf Area")+ 
+    theme_classic()
+  return(model_plot)}
+
+#This defines the form different model statics are in so that it can be used in future functions without having to redefine them each time.}
+model_statistics <- data.frame(
+  r2 = as.numeric(1),
+  RMSE = as.numeric(1),
+  stats_text = "a",
+  model_name = "a",
+  stringsAsFactors = FALSE)
+formula_str <- "leaf_area ~ ."
+
+#Creates a function that allows you to run random forest on a list of data sets. 
+run_model_on_list <- function(data, model_name) {
+  model_plot <- run_ranger_model(
+    data = data,
+    data_name = model_name,
+    formula_string = formula_str,
+    seed_num = 1452,
+    text_position = 15,
+    model_stats_data = model_statistics)
+    model_plot}
+#applies the function run_model_on_list to all dataframes contained within the my_model_data list
+my_model_plots <- mapply(run_model_on_list, my_model_data, names(my_model_data), SIMPLIFY = FALSE)
+
+#Uses a loop to save plots of all models
+for (plot_name in names(my_model_plots)) {
+  plot_obj <- my_model_plots[[plot_name]]
+  file_path <- file.path("plots", paste0(plot_name, ".png"))
+  ggsave(filename = file_path, plot = plot_obj, width = 6, height = 4)}
+
+#Uses a loop to print plots of all models
+for(plot_name in names(my_model_plots)){
+  plot <- my_model_plots[[plot_name]]
+  plot <- plot +
+      labs(title = plot_name)
+  print(plot)}
+
+```
+
+# Model Comparisons
+
+## Creating comparative box plots to assess differences in RMSE as the number of variables within the model increases.
+
+```{r}
+set.seed(123)
+model_statistics <- data.frame(
+  r2 = as.numeric(1),
+  RMSE = as.numeric(1),
+  model_name = "a",
+  group = "a",
+  stringsAsFactors = FALSE)
+#produces a vector of random numbers that can ran in a loop to set new seeds for different testing and training splits. 
+#Here 100 seeds will be tried.
+seed_numbers <- sample(1:1000, 100, replace = FALSE) 
+
+#create function to run in a loop to produce model statistics for multiple models.
+run_model_on_list_with_seed <- function(data, data_name, seed_num, ...){
+  npoints <- nrow(data)
+  set.seed(seed_num)
+  train_ids <- sample(npoints, 3/4*npoints) #randomly sample 3/4 of the points 
+  train <- data %>% slice(train_ids)
+  test <- data %>% slice(-train_ids)
+  relationship <- as.formula("leaf_area ~ .")
+  set.seed(seed_num)
+  ranger_model <- ranger(relationship, 
+                  data = train)
+  pred <- function(fit, data) predict(fit, data = data)$prediction
+  train <- train %>% mutate(group = "training",
+                                      predicted = pred(ranger_model,train))
+  test <- test %>%  mutate(group = "testing",
+                                     predicted =  pred(ranger_model, test))
+  data_pred <-  rbind(train, test)  %>%
+    mutate(group = factor(group, levels = c("training", "testing")))
+  model_stats <- data_pred %>%
+    group_by(group) %>% 
+    summarise(r2 = cor(leaf_area, predicted)^2,
+            RMSE = sqrt(sum((leaf_area - predicted)^2)/n()))%>%
+    ungroup()%>%
+    mutate(model_name = data_name)
+  model_statistics <- rbind(model_statistics, model_stats)
+  return(model_statistics)}
+
+#Run a loop to produce the statistics for each combination of variables that we are interested in testing
+#this will take some computation time. Use a short seed_numbers for quicker computation.
+#Current Iteration can be printed to check progress of the loop if desired.
+#current_iteration <- 0
+data_names <- names(my_model_data)
+for (i in seed_numbers) {
+  for (data_name in data_names) {
+    data <- my_model_data[[data_name]]
+    #current_iteration <- current_iteration + 1
+    #cat("Current Iteration:", current_iteration, "\n")
+    model_statistics <- run_model_on_list_with_seed(data=data, data_name = data_name, seed_num = i)}}
+
+#get means for model statistics
+summary_statistics <- model_statistics %>% 
+  select(model_name, r2, RMSE)%>%
+  group_by(model_name)%>%
+  summarise(r2 = mean(r2),
+            RSME = mean(RMSE))
+
+#Create comparitive boxplots of RMSE for the models with the top 15 importance.
+importance <- importance %>% mutate(number_of_dv = rank(feature_importance)) #create ranks so that boxes can be plot in order
+important_models <- model_statistics %>% 
+  filter(group == "testing")%>%
+  filter(grepl("important", model_name))%>%
+  mutate(char_count = nchar(model_name),
+         number_of_dv = dense_rank(char_count))%>%
+  arrange(number_of_dv) %>% 
+  left_join(importance, by = "number_of_dv") %>%
+  mutate(variables = gsub("_", " ", variables)) %>%
+  arrange(number_of_dv)
+
+variable_inclusion <- ggplot(important_models, aes(y = RMSE, x = as.factor(number_of_dv)))+
+  geom_boxplot(fill = "grey") +
+  xlab("Number of variables Included")+
+  theme_classic()+
+  theme(text = element_text(size = 30))
+variable_inclusion #Print plot
+ggsave(file.path("plots", "variable_inclusion5.png"), variable_inclusion, height = 10, width = 12) #save plot
+
+model_statistics <- model_statistics %>%
+  mutate(
+    number_of_dv = case_when(
+      model_name == "important_traits_1_leaf_area_leaf_length" ~ 1,
+      model_name == "important_traits_2_leaf_area_leaf_length_leaf_width" ~ 2,
+      model_name == "important_traits_3_leaf_area_leaf_length_plant_height_leaf_width" ~ 3,
+      model_name == "important_traits_4_leaf_area_plant_growth_form_leaf_length_plant_height_leaf_width" ~ 4,
+      model_name == "important_traits_5_leaf_area_plant_growth_form_leaf_length_plant_height_leaf_width_family" ~ 5,
+      model_name == "important_traits_6_leaf_area_leaf_shape_plant_growth_form_leaf_length_plant_height_leaf_width_family" ~ 6,
+      model_name == "_leaf_area_leaf_length_leaf_width_plant_height_plant_growth_form_family_leaf_shape_woodiness_detailed" ~ 7,
+      model_name == 
+        "_leaf_area_leaf_length_leaf_width_plant_height_plant_growth_form_family_leaf_shape_woodiness_detailed_life_history" ~ 8))
+
+selected_models <- model_statistics %>%
+  filter(!(is.na(number_of_dv)))%>%
+  filter(group == "testing")
+
+variable_inclusion_short <- ggplot(selected_models, aes(y = RMSE, x = as.factor(number_of_dv)))+
+  geom_boxplot(fill = "grey") +
+  xlab("Number of variables Included")+
+  theme_classic()+
+  theme(text = element_text(size = 30))
+variable_inclusion_short #Print plot
+ggsave(file.path("plots", "variable_inclusion6.png"), variable_inclusion_short, height = 10, width = 12) #save plot
+
+```
